@@ -45,6 +45,9 @@ def get_trainers(trainer):
     if trainer == 'DiT_ImageNet':
         from trainers import dit_imagenet
         return dit_imagenet
+    elif trainer == 'RAE_Stage1':
+        from trainers import rae_stage1
+        return rae_stage1
     else:
         raise ValueError(f'Unknown trainer: {trainer}')
 

@@ -25,6 +25,14 @@ _imagenet_data_presets = {
         data_dir='/mnt/disks/raw_data/datasets/imagenet', image_size=512, batch_size=256, latent_dataset=False, num_train_samples=1281167,
         stat_dir='/mnt/disks/data/stats/imagenet_512.pkl'
     ),
+    'celebahq_256': dict(
+        data_dir='/home/ngothanhnam508/data/celebahq',
+        image_size=256,
+        batch_size=128,
+        latent_dataset=False,
+        num_train_samples=28000,
+        stat_dir='',
+    ),
 }
 
 _imagenet_encoder_presets = {
@@ -69,7 +77,13 @@ _imagenet_rae_encoder_presets = {
         encoder_kwargs=dict(
             downsample_factor=16, latent_channels=768, pretrained_path='/home/nm3607/model.pt'
         )
-    )
+    ),
+    'celebahq_256': dict(
+        encoder='RAE',
+        encoder_kwargs=dict(
+            downsample_factor=16, latent_channels=768, pretrained_path='RAE-Stage1-CelebAHQ/decoder.pt'
+        )
+    ),
 }
 
 _dit_network_presets = {

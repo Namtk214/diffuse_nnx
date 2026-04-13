@@ -191,7 +191,7 @@ class InfiniteSampler(torch.utils.data.Sampler):
         assert num_replicas > 0
         assert 0 <= rank < num_replicas
         warnings.filterwarnings('ignore', '`data_source` argument is not used and will be removed')
-        super().__init__(dataset)
+        super().__init__()
         self._dataset_size = len(dataset)
         self._start_idx = start_idx + rank
         self._stride = num_replicas
