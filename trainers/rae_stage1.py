@@ -41,6 +41,12 @@ def _extract_last_layer_kernel(tree):
     return tree.decoder_pred.kernel
 
 
+def _fake_quantize_unit_range(x: jnp.ndarray) -> jnp.ndarray:
+    """Match the public PyTorch discriminator fake quantization in [-1,1]."""
+    x = jnp.clip(x, -1.0, 1.0)
+    return jnp.round((x + 1.0) * 127.5) / 127.5 - 1.0
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Helpers: differentiable encode/decode for training
 # (Stock RAE.encode / RAE.decode are decorated with @nnx.jit and can't
@@ -122,7 +128,7 @@ def decode_for_training(rae_model, z: jnp.ndarray) -> jnp.ndarray:
         'rae_model', 'disc_graphdef', 'lpips_model', 'diffaug',
         'gen_optimizer', 'disc_optimizer',
         'ema_decay', 'disc_start', 'disc_upd_start', 'lpips_start',
-        'perceptual_weight', 'disc_weight_val', 'max_d_weight', 'disc_loss_type',
+        'perceptual_weight', 'disc_weight_val', 'max_d_weight', 'disc_loss_type', 'disc_updates',
     ),
 )
 def train_step(
@@ -133,7 +139,7 @@ def train_step(
     gen_optimizer, disc_optimizer,
     rng, epoch,
     ema_decay, disc_start, disc_upd_start, lpips_start,
-    perceptual_weight, disc_weight_val, max_d_weight, disc_loss_type,
+    perceptual_weight, disc_weight_val, max_d_weight, disc_loss_type, disc_updates,
 ):
     rng_noise, rng_gen_aug, rng_disc = jax.random.split(rng, 3)
     rng_disc_real, rng_disc_fake = jax.random.split(rng_disc)
@@ -148,10 +154,12 @@ def train_step(
 
     def _nll_only(dec_params):
         x_rec, target = _reconstruct(dec_params, images, rng_noise, True)
+        real_normed = images.transpose(0, 3, 1, 2)
+        recon_normed = x_rec * 2.0 - 1.0
         rec_loss = jnp.mean(jnp.abs(x_rec - target))
         lpips_val = jax.lax.cond(
             epoch >= lpips_start,
-            lambda: lpips_model(target, x_rec),
+            lambda: lpips_model(real_normed, recon_normed),
             lambda: jnp.zeros(()),
         )
         return rec_loss + perceptual_weight * lpips_val
@@ -180,11 +188,12 @@ def train_step(
 
     def gen_loss_fn(dec_params):
         x_rec, target = _reconstruct(dec_params, images, rng_noise, True)
+        real_normed = images.transpose(0, 3, 1, 2)
         normed_x_rec = x_rec * 2.0 - 1.0
         rec_loss = jnp.mean(jnp.abs(x_rec - target))
         lpips_val = jax.lax.cond(
             epoch >= lpips_start,
-            lambda: lpips_model(target, x_rec),
+            lambda: lpips_model(real_normed, normed_x_rec),
             lambda: jnp.zeros(()),
         )
         nll_loss = rec_loss + perceptual_weight * lpips_val
@@ -214,15 +223,25 @@ def train_step(
             disc = nnx.merge(disc_graphdef, d_params)
             # Disc expects NCHW [-1,1]
             real_nchw = images.transpose(0, 3, 1, 2)   # NHWC [-1,1] → NCHW [-1,1]
-            normed_fake = jax.lax.stop_gradient(fresh_recon) * 2.0 - 1.0  # [0,1] → [-1,1]
+            normed_fake = _fake_quantize_unit_range(jax.lax.stop_gradient(fresh_recon) * 2.0 - 1.0)  # [0,1] → [-1,1]
             real_aug = diffaug(real_nchw, rng_disc_real)
             fake_aug = diffaug(normed_fake, rng_disc_fake)
             lr, lf = disc.classify(real_aug), disc.classify(fake_aug)
             disc_loss = hinge_d_loss(lr, lf) if disc_loss_type == "hinge" else vanilla_d_loss(lr, lf)
             return disc_loss * disc_weight_val
-        d_loss, d_grads = jax.value_and_grad(disc_loss_fn)(dp)
-        d_upd, new_dos = disc_optimizer.update(d_grads, dos, dp)
-        return optax.apply_updates(dp, d_upd), new_dos, d_loss
+        def one_disc_update(i, carry):
+            cur_dp, cur_dos, loss_sum = carry
+            d_loss, d_grads = jax.value_and_grad(disc_loss_fn)(cur_dp)
+            d_upd, next_dos = disc_optimizer.update(d_grads, cur_dos, cur_dp)
+            next_dp = optax.apply_updates(cur_dp, d_upd)
+            return next_dp, next_dos, loss_sum + d_loss
+        next_dp, next_dos, loss_sum = jax.lax.fori_loop(
+            0,
+            disc_updates,
+            one_disc_update,
+            (dp, dos, jnp.zeros(())),
+        )
+        return next_dp, next_dos, loss_sum / disc_updates
 
     new_disc_params, new_disc_opt, disc_loss = jax.lax.cond(
         epoch >= disc_upd_start,
@@ -249,7 +268,7 @@ def train_step(
         'rae_model', 'disc_graphdef', 'lpips_model', 'diffaug',
         'gen_optimizer', 'disc_optimizer',
         'ema_decay', 'disc_start', 'disc_upd_start', 'lpips_start',
-        'perceptual_weight', 'disc_weight_val', 'max_d_weight', 'disc_loss_type',
+        'perceptual_weight', 'disc_weight_val', 'max_d_weight', 'disc_loss_type', 'disc_updates',
     ),
 )
 def train_step_accumulated(
@@ -260,7 +279,7 @@ def train_step_accumulated(
     gen_optimizer, disc_optimizer,
     rng, epoch,
     ema_decay, disc_start, disc_upd_start, lpips_start,
-    perceptual_weight, disc_weight_val, max_d_weight, disc_loss_type,
+    perceptual_weight, disc_weight_val, max_d_weight, disc_loss_type, disc_updates,
 ):
     """Full optimizer step with gradient accumulation using jax.lax.scan.
 
@@ -286,10 +305,12 @@ def train_step_accumulated(
 
         def _nll_only(dec_params):
             x_rec, target = _reconstruct(dec_params, True)
+            real_normed = images_mb.transpose(0, 3, 1, 2)
+            recon_normed = x_rec * 2.0 - 1.0
             rec_loss = jnp.mean(jnp.abs(x_rec - target))
             lpips_val = jax.lax.cond(
                 epoch >= lpips_start,
-                lambda: lpips_model(target, x_rec),
+                lambda: lpips_model(real_normed, recon_normed),
                 lambda: jnp.zeros(()),
             )
             return rec_loss + perceptual_weight * lpips_val
@@ -318,11 +339,12 @@ def train_step_accumulated(
 
         def gen_loss_fn(dec_params):
             x_rec, target = _reconstruct(dec_params, True)
+            real_normed = images_mb.transpose(0, 3, 1, 2)
             normed_x_rec = x_rec * 2.0 - 1.0
             rec_loss = jnp.mean(jnp.abs(x_rec - target))
             lpips_val = jax.lax.cond(
                 epoch >= lpips_start,
-                lambda: lpips_model(target, x_rec),
+                lambda: lpips_model(real_normed, normed_x_rec),
                 lambda: jnp.zeros(()),
             )
             nll_loss = rec_loss + perceptual_weight * lpips_val
@@ -372,7 +394,7 @@ def train_step_accumulated(
     )
 
     # ── Discriminator gradients after generator update ───────────────
-    def disc_micro_step(carry, xs):
+    def disc_micro_step(active_disc_params, carry, xs):
         acc_disc, acc_dloss, rng_carry = carry
         images_mb = xs
         rng_carry, rng_step = jax.random.split(rng_carry)
@@ -385,7 +407,7 @@ def train_step_accumulated(
             def disc_loss_fn(d_params):
                 disc = nnx.merge(disc_graphdef, d_params)
                 real_nchw = images_mb.transpose(0, 3, 1, 2)
-                normed_fake = jax.lax.stop_gradient(fresh_rec) * 2.0 - 1.0
+                normed_fake = _fake_quantize_unit_range(jax.lax.stop_gradient(fresh_rec) * 2.0 - 1.0)
                 real_aug = diffaug(real_nchw, rng_disc_real)
                 fake_aug = diffaug(normed_fake, rng_disc_fake)
                 lr, lf = disc.classify(real_aug), disc.classify(fake_aug)
@@ -398,23 +420,41 @@ def train_step_accumulated(
             epoch >= disc_upd_start,
             _disc_grads_fn,
             lambda dp: (jax.tree.map(jnp.zeros_like, dp), jnp.zeros(())),
-            disc_params,
+            active_disc_params,
         )
         new_acc_disc = jax.tree.map(lambda a, b: a + b, acc_disc, disc_grads)
         return (new_acc_disc, acc_dloss + disc_loss, rng_carry), None
 
     zero_disc = jax.tree.map(jnp.zeros_like, disc_params)
-    (acc_disc, acc_dloss, _), _ = jax.lax.scan(
-        disc_micro_step,
-        (zero_disc, jnp.zeros(()), disc_rng),
-        images_stacked,
+
+    def one_disc_update(i, carry):
+        cur_disc_params, cur_disc_opt, loss_sum = carry
+        (acc_disc, acc_dloss, _), _ = jax.lax.scan(
+            lambda inner_carry, xs: disc_micro_step(cur_disc_params, inner_carry, xs),
+            (zero_disc, jnp.zeros(()), disc_rng),
+            images_stacked,
+        )
+        avg_disc = jax.tree.map(lambda g: g / accum_steps, acc_disc)
+        disc_upd, next_disc_opt = disc_optimizer.update(avg_disc, cur_disc_opt, cur_disc_params)
+        next_disc_params = optax.apply_updates(cur_disc_params, disc_upd)
+        return next_disc_params, next_disc_opt, loss_sum + (acc_dloss / accum_steps)
+
+    def run_disc_updates(dp, dos):
+        return jax.lax.fori_loop(
+            0,
+            disc_updates,
+            one_disc_update,
+            (dp, dos, jnp.zeros(())),
+        )
+
+    new_disc_params, new_disc_opt, disc_loss_sum = jax.lax.cond(
+        epoch >= disc_upd_start,
+        run_disc_updates,
+        lambda dp, dos: (dp, dos, jnp.zeros(())),
+        disc_params,
+        disc_opt_state,
     )
-    avg_disc = jax.tree.map(lambda g: g / accum_steps, acc_disc)
-    metrics["d_loss"] = acc_dloss / accum_steps
-
-    disc_upd, new_disc_opt = disc_optimizer.update(avg_disc, disc_opt_state, disc_params)
-    new_disc_params = optax.apply_updates(disc_params, disc_upd)
-
+    metrics["d_loss"] = disc_loss_sum / jnp.maximum(disc_updates, 1)
     return new_dec_params, new_dec_opt, new_ema, new_disc_params, new_disc_opt, metrics
 
 
@@ -429,7 +469,9 @@ def valid_step_fn(decoder_params, images, rae_model, lpips_model):
     x_rec = decode_for_training(rae_model, z)
     target = ((images + 1.0) / 2.0).transpose(0, 3, 1, 2)
     rec_loss = jnp.mean(jnp.abs(x_rec - target))
-    lpips_val = lpips_model(target, x_rec)
+    real_normed = images.transpose(0, 3, 1, 2)
+    recon_normed = x_rec * 2.0 - 1.0
+    lpips_val = lpips_model(real_normed, recon_normed)
     return rec_loss, lpips_val, x_rec, target
 
 
@@ -708,7 +750,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                     rae_model, disc_graphdef, lpips_model, diffaug,
                     gen_optimizer, disc_optimizer,
                     rng_step, epoch,
-                    ema_decay        = config.stage1.ema_decay,
+                 ema_decay        = config.stage1.ema_decay,
                     disc_start       = loss_cfg.disc_start,
                     disc_upd_start   = loss_cfg.disc_upd_start,
                     lpips_start      = loss_cfg.lpips_start,
@@ -716,6 +758,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
                     disc_weight_val  = loss_cfg.disc_weight,
                     max_d_weight     = loss_cfg.get('max_d_weight', 10000.0),
                     disc_loss_type   = loss_cfg.disc_loss,
+                    disc_updates     = loss_cfg.get('disc_updates', 1),
                 )
 
                 for k, v in step_metrics.items():
@@ -848,3 +891,4 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
     logging.info(f'[RAE Stage1] Training complete. Final step: {step}')
     return {}
+

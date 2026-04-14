@@ -41,12 +41,14 @@ def get_config():
 
     config.stage1.loss = ml_collections.ConfigDict()
     config.stage1.loss.disc_loss         = 'hinge'
+    config.stage1.loss.gen_loss          = 'vanilla'
     config.stage1.loss.disc_weight       = 0.75
     config.stage1.loss.perceptual_weight = 1.0
     config.stage1.loss.disc_start        = 8   # epoch bắt đầu GAN generator loss
     config.stage1.loss.disc_upd_start    = 6   # epoch bắt đầu update discriminator
     config.stage1.loss.lpips_start       = 0
     config.stage1.loss.max_d_weight      = 10000.0
+    config.stage1.loss.disc_updates      = 1
 
     # ── Discriminator ────────────────────────────────────────────────
     config.gan = ml_collections.ConfigDict()
@@ -70,3 +72,4 @@ def get_config():
     config.checkpoint.options.enable_async_checkpointing = False
 
     return config
+
