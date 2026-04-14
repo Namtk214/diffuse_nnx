@@ -36,6 +36,11 @@ from disc import build_discriminator, LPIPS, hinge_d_loss, vanilla_g_loss
 from disc.gan_loss import vanilla_d_loss
 
 
+def _extract_last_layer_kernel(tree):
+    """Return the decoder prediction kernel from an nnx state/grad pytree."""
+    return tree.decoder_pred.kernel
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Helpers: differentiable encode/decode for training
 # (Stock RAE.encode / RAE.decode are decorated with @nnx.jit and can't
@@ -134,46 +139,63 @@ def train_step(
     rng_disc_real, rng_disc_fake = jax.random.split(rng_disc)
 
     # ── Generator loss ───────────────────────────────────────────────
-    def gen_loss_fn(dec_params):
+    def _reconstruct(dec_params, image_batch, noise_rng, training: bool):
         nnx.update(rae_model.decoder, dec_params)
+        z = encode_for_training(rae_model, image_batch, rng=noise_rng, training=training)
+        x_rec = decode_for_training(rae_model, z)
+        target = ((image_batch + 1.0) / 2.0).transpose(0, 3, 1, 2)
+        return x_rec, target
 
-        z = encode_for_training(rae_model, images, rng=rng_noise, training=True)
-        x_rec = decode_for_training(rae_model, z)    # (B, C, H, W) [0,1]
-
-        # Target: NHWC [-1,1] → NCHW [0,1] for rec loss and LPIPS
-        target = ((images + 1.0) / 2.0).transpose(0, 3, 1, 2)
-
-        # Reconstruction loss (L1)
+    def _nll_only(dec_params):
+        x_rec, target = _reconstruct(dec_params, images, rng_noise, True)
         rec_loss = jnp.mean(jnp.abs(x_rec - target))
-
-        # LPIPS (expects NCHW [0,1])
         lpips_val = jax.lax.cond(
             epoch >= lpips_start,
-            lambda: lpips_model(x_rec, target),
+            lambda: lpips_model(target, x_rec),
             lambda: jnp.zeros(()),
         )
-        rec_total = rec_loss + perceptual_weight * lpips_val
+        return rec_loss + perceptual_weight * lpips_val
 
-        # GAN generator loss — disc expects NCHW [-1,1]
+    def _gan_only(dec_params):
+        x_rec, _ = _reconstruct(dec_params, images, rng_noise, True)
+        normed_x_rec = x_rec * 2.0 - 1.0
+        return jax.lax.cond(
+            epoch >= disc_start,
+            lambda: vanilla_g_loss(nnx.merge(disc_graphdef, disc_params).classify(diffaug(normed_x_rec, rng_gen_aug))),
+            lambda: jnp.zeros(()),
+        )
+
+    def _adp_w():
+        nll_grads = jax.grad(_nll_only)(decoder_params)
+        gan_grads = jax.grad(_gan_only)(decoder_params)
+        nll_last = _extract_last_layer_kernel(nll_grads)
+        gan_last = _extract_last_layer_kernel(gan_grads)
+        return jnp.clip(
+            jnp.linalg.norm(nll_last) / (jnp.linalg.norm(gan_last) + 1e-6),
+            0.0,
+            max_d_weight,
+        )
+
+    adp_w = jax.lax.cond(epoch >= disc_start, _adp_w, lambda: jnp.zeros(()))
+
+    def gen_loss_fn(dec_params):
+        x_rec, target = _reconstruct(dec_params, images, rng_noise, True)
+        normed_x_rec = x_rec * 2.0 - 1.0
+        rec_loss = jnp.mean(jnp.abs(x_rec - target))
+        lpips_val = jax.lax.cond(
+            epoch >= lpips_start,
+            lambda: lpips_model(target, x_rec),
+            lambda: jnp.zeros(()),
+        )
+        nll_loss = rec_loss + perceptual_weight * lpips_val
         def _gan_g():
-            normed_x_rec = x_rec * 2.0 - 1.0          # [0,1] → [-1,1]
             x_aug = diffaug(normed_x_rec, rng_gen_aug)
             return vanilla_g_loss(nnx.merge(disc_graphdef, disc_params).classify(x_aug))
-
         g_loss = jax.lax.cond(epoch >= disc_start, _gan_g, lambda: jnp.zeros(()))
+        total = nll_loss + disc_weight_val * adp_w * g_loss
+        return total, (rec_loss, lpips_val, nll_loss, g_loss, x_rec)
 
-        # Adaptive discriminator weight
-        def _adp_w():
-            return jnp.clip(
-                jnp.sqrt(rec_total**2 + 1e-6) / jnp.sqrt(g_loss**2 + 1e-6),
-                0.0, max_d_weight,
-            )
-        adp_w = jax.lax.cond(epoch >= disc_start, _adp_w, lambda: jnp.zeros(()))
-
-        total = rec_total + disc_weight_val * adp_w * g_loss
-        return total, (rec_loss, lpips_val, g_loss, adp_w, x_rec)
-
-    (total_loss, (rec_loss, lpips_val, g_loss, adp_w, x_rec)), grads = \
+    (total_loss, (rec_loss, lpips_val, nll_loss, g_loss, x_rec)), grads = \
         jax.value_and_grad(gen_loss_fn, has_aux=True)(decoder_params)
 
     gen_upd, new_dec_opt = gen_optimizer.update(grads, decoder_opt_state, decoder_params)
@@ -187,15 +209,17 @@ def train_step(
 
     # ── Discriminator loss ───────────────────────────────────────────
     def _disc_step(dp, dos):
+        fresh_recon, _ = _reconstruct(new_dec_params, images, rng_noise, False)
         def disc_loss_fn(d_params):
             disc = nnx.merge(disc_graphdef, d_params)
             # Disc expects NCHW [-1,1]
             real_nchw = images.transpose(0, 3, 1, 2)   # NHWC [-1,1] → NCHW [-1,1]
-            normed_fake = jax.lax.stop_gradient(x_rec) * 2.0 - 1.0  # [0,1] → [-1,1]
+            normed_fake = jax.lax.stop_gradient(fresh_recon) * 2.0 - 1.0  # [0,1] → [-1,1]
             real_aug = diffaug(real_nchw, rng_disc_real)
             fake_aug = diffaug(normed_fake, rng_disc_fake)
             lr, lf = disc.classify(real_aug), disc.classify(fake_aug)
-            return hinge_d_loss(lr, lf) if disc_loss_type == "hinge" else vanilla_d_loss(lr, lf)
+            disc_loss = hinge_d_loss(lr, lf) if disc_loss_type == "hinge" else vanilla_d_loss(lr, lf)
+            return disc_loss * disc_weight_val
         d_loss, d_grads = jax.value_and_grad(disc_loss_fn)(dp)
         d_upd, new_dos = disc_optimizer.update(d_grads, dos, dp)
         return optax.apply_updates(dp, d_upd), new_dos, d_loss
@@ -244,97 +268,98 @@ def train_step_accumulated(
     """
     accum_steps = images_stacked.shape[0]
 
-    # ── Per-micro-batch grad computation (no optimizer update) ───────
-    def micro_step(carry, xs):
-        """carry = (acc_gen_grads, acc_disc_grads, acc_metrics, rng)"""
-        acc_gen, acc_disc, acc_m, rng_carry = carry
+    # ── Generator micro-batch grad computation ───────────────────────
+    def gen_micro_step(carry, xs):
+        """carry = (acc_gen_grads, acc_metrics, rng)"""
+        acc_gen, acc_m, rng_carry = carry
         images_mb = xs  # [micro_bs, H, W, C]
 
         rng_carry, rng_step = jax.random.split(rng_carry)
-        rng_noise, rng_gen_aug, rng_disc = jax.random.split(rng_step, 3)
-        rng_disc_real, rng_disc_fake = jax.random.split(rng_disc)
+        rng_noise, rng_gen_aug = jax.random.split(rng_step, 2)
 
-        def gen_loss_fn(dec_params):
+        def _reconstruct(dec_params, training: bool):
             nnx.update(rae_model.decoder, dec_params)
             z = encode_for_training(rae_model, images_mb, rng=rng_noise, training=True)
             x_rec = decode_for_training(rae_model, z)    # NCHW [0,1]
             target = ((images_mb + 1.0) / 2.0).transpose(0, 3, 1, 2)  # NCHW [0,1]
+            return x_rec, target
 
+        def _nll_only(dec_params):
+            x_rec, target = _reconstruct(dec_params, True)
             rec_loss = jnp.mean(jnp.abs(x_rec - target))
             lpips_val = jax.lax.cond(
                 epoch >= lpips_start,
-                lambda: lpips_model(x_rec, target),
+                lambda: lpips_model(target, x_rec),
                 lambda: jnp.zeros(()),
             )
-            rec_total = rec_loss + perceptual_weight * lpips_val
+            return rec_loss + perceptual_weight * lpips_val
 
-            # GAN generator loss — disc expects NCHW [-1,1]
+        def _gan_only(dec_params):
+            x_rec, _ = _reconstruct(dec_params, True)
+            normed_x_rec = x_rec * 2.0 - 1.0
+            return jax.lax.cond(
+                epoch >= disc_start,
+                lambda: vanilla_g_loss(nnx.merge(disc_graphdef, disc_params).classify(diffaug(normed_x_rec, rng_gen_aug))),
+                lambda: jnp.zeros(()),
+            )
+
+        def _adp_w():
+            nll_grads = jax.grad(_nll_only)(decoder_params)
+            gan_grads = jax.grad(_gan_only)(decoder_params)
+            nll_last = _extract_last_layer_kernel(nll_grads)
+            gan_last = _extract_last_layer_kernel(gan_grads)
+            return jnp.clip(
+                jnp.linalg.norm(nll_last) / (jnp.linalg.norm(gan_last) + 1e-6),
+                0.0,
+                max_d_weight,
+            )
+
+        adp_w = jax.lax.cond(epoch >= disc_start, _adp_w, lambda: jnp.zeros(()))
+
+        def gen_loss_fn(dec_params):
+            x_rec, target = _reconstruct(dec_params, True)
+            normed_x_rec = x_rec * 2.0 - 1.0
+            rec_loss = jnp.mean(jnp.abs(x_rec - target))
+            lpips_val = jax.lax.cond(
+                epoch >= lpips_start,
+                lambda: lpips_model(target, x_rec),
+                lambda: jnp.zeros(()),
+            )
+            nll_loss = rec_loss + perceptual_weight * lpips_val
             def _gan_g():
-                normed_x_rec = x_rec * 2.0 - 1.0     # [0,1] → [-1,1]
                 x_aug = diffaug(normed_x_rec, rng_gen_aug)
                 return vanilla_g_loss(nnx.merge(disc_graphdef, disc_params).classify(x_aug))
             g_loss = jax.lax.cond(epoch >= disc_start, _gan_g, lambda: jnp.zeros(()))
+            total = nll_loss + disc_weight_val * adp_w * g_loss
+            return total, (rec_loss, lpips_val, nll_loss, g_loss, x_rec)
 
-            def _adp_w():
-                return jnp.clip(
-                    jnp.sqrt(rec_total**2 + 1e-6) / jnp.sqrt(g_loss**2 + 1e-6),
-                    0.0, max_d_weight,
-                )
-            adp_w = jax.lax.cond(epoch >= disc_start, _adp_w, lambda: jnp.zeros(()))
-            total = rec_total + disc_weight_val * adp_w * g_loss
-            return total, (rec_loss, lpips_val, g_loss, adp_w, x_rec)
-
-        (total_loss, (rec_loss, lpips_val, g_loss, adp_w, x_rec)), gen_grads = \
+        (total_loss, (rec_loss, lpips_val, nll_loss, g_loss, x_rec)), gen_grads = \
             jax.value_and_grad(gen_loss_fn, has_aux=True)(decoder_params)
-
-        def _disc_grads_fn(dp):
-            def disc_loss_fn(d_params):
-                disc   = nnx.merge(disc_graphdef, d_params)
-                # Disc expects NCHW [-1,1]
-                real_nchw = images_mb.transpose(0, 3, 1, 2)  # NHWC [-1,1] → NCHW [-1,1]
-                normed_fake = jax.lax.stop_gradient(x_rec) * 2.0 - 1.0  # [0,1] → [-1,1]
-                real_aug  = diffaug(real_nchw, rng_disc_real)
-                fake_aug  = diffaug(normed_fake, rng_disc_fake)
-                lr, lf = disc.classify(real_aug), disc.classify(fake_aug)
-                return hinge_d_loss(lr, lf) if disc_loss_type == "hinge" else vanilla_d_loss(lr, lf)
-            d_loss, d_grads = jax.value_and_grad(disc_loss_fn)(dp)
-            return d_grads, d_loss
-
-        disc_grads, disc_loss = jax.lax.cond(
-            epoch >= disc_upd_start,
-            _disc_grads_fn,
-            lambda dp: (jax.tree.map(jnp.zeros_like, dp), jnp.zeros(())),
-            disc_params,
-        )
 
         # Accumulate
         new_acc_gen  = jax.tree.map(lambda a, b: a + b, acc_gen,  gen_grads)
-        new_acc_disc = jax.tree.map(lambda a, b: a + b, acc_disc, disc_grads)
         new_acc_m    = {
             "total_loss": acc_m["total_loss"] + total_loss,
             "rec_loss":   acc_m["rec_loss"]   + rec_loss,
             "lpips_loss": acc_m["lpips_loss"] + lpips_val,
             "g_loss":     acc_m["g_loss"]      + g_loss,
-            "d_loss":     acc_m["d_loss"]      + disc_loss,
             "d_weight":   acc_m["d_weight"]    + adp_w,
         }
-        return (new_acc_gen, new_acc_disc, new_acc_m, rng_carry), None
+        return (new_acc_gen, new_acc_m, rng_carry), None
 
     # Initialise accumulators
     zero_gen  = jax.tree.map(jnp.zeros_like, decoder_params)
-    zero_disc = jax.tree.map(jnp.zeros_like, disc_params)
     zero_metrics = {k: jnp.zeros(()) for k in
-                    ["total_loss", "rec_loss", "lpips_loss", "g_loss", "d_loss", "d_weight"]}
+                    ["total_loss", "rec_loss", "lpips_loss", "g_loss", "d_weight"]}
 
-    (acc_gen, acc_disc, acc_m, _), _ = jax.lax.scan(
-        micro_step,
-        (zero_gen, zero_disc, zero_metrics, rng),
+    (acc_gen, acc_m, disc_rng), _ = jax.lax.scan(
+        gen_micro_step,
+        (zero_gen, zero_metrics, rng),
         images_stacked,           # xs: [accum_steps, micro_bs, H, W, C]
     )
 
     # Average
     avg_gen  = jax.tree.map(lambda g: g / accum_steps, acc_gen)
-    avg_disc = jax.tree.map(lambda g: g / accum_steps, acc_disc)
     metrics  = {k: v / accum_steps for k, v in acc_m.items()}
 
     # ── Apply gradients ──────────────────────────────────────────────
@@ -345,6 +370,47 @@ def train_step_accumulated(
         lambda e, p: ema_decay * e + (1 - ema_decay) * p,
         ema_params, new_dec_params,
     )
+
+    # ── Discriminator gradients after generator update ───────────────
+    def disc_micro_step(carry, xs):
+        acc_disc, acc_dloss, rng_carry = carry
+        images_mb = xs
+        rng_carry, rng_step = jax.random.split(rng_carry)
+        rng_disc_real, rng_disc_fake = jax.random.split(rng_step)
+
+        def _disc_grads_fn(dp):
+            nnx.update(rae_model.decoder, new_dec_params)
+            fresh_z = encode_for_training(rae_model, images_mb, rng=None, training=False)
+            fresh_rec = decode_for_training(rae_model, fresh_z)
+            def disc_loss_fn(d_params):
+                disc = nnx.merge(disc_graphdef, d_params)
+                real_nchw = images_mb.transpose(0, 3, 1, 2)
+                normed_fake = jax.lax.stop_gradient(fresh_rec) * 2.0 - 1.0
+                real_aug = diffaug(real_nchw, rng_disc_real)
+                fake_aug = diffaug(normed_fake, rng_disc_fake)
+                lr, lf = disc.classify(real_aug), disc.classify(fake_aug)
+                disc_loss = hinge_d_loss(lr, lf) if disc_loss_type == "hinge" else vanilla_d_loss(lr, lf)
+                return disc_loss * disc_weight_val
+            d_loss, d_grads = jax.value_and_grad(disc_loss_fn)(dp)
+            return d_grads, d_loss
+
+        disc_grads, disc_loss = jax.lax.cond(
+            epoch >= disc_upd_start,
+            _disc_grads_fn,
+            lambda dp: (jax.tree.map(jnp.zeros_like, dp), jnp.zeros(())),
+            disc_params,
+        )
+        new_acc_disc = jax.tree.map(lambda a, b: a + b, acc_disc, disc_grads)
+        return (new_acc_disc, acc_dloss + disc_loss, rng_carry), None
+
+    zero_disc = jax.tree.map(jnp.zeros_like, disc_params)
+    (acc_disc, acc_dloss, _), _ = jax.lax.scan(
+        disc_micro_step,
+        (zero_disc, jnp.zeros(()), disc_rng),
+        images_stacked,
+    )
+    avg_disc = jax.tree.map(lambda g: g / accum_steps, acc_disc)
+    metrics["d_loss"] = acc_dloss / accum_steps
 
     disc_upd, new_disc_opt = disc_optimizer.update(avg_disc, disc_opt_state, disc_params)
     new_disc_params = optax.apply_updates(disc_params, disc_upd)
@@ -363,7 +429,7 @@ def valid_step_fn(decoder_params, images, rae_model, lpips_model):
     x_rec = decode_for_training(rae_model, z)
     target = ((images + 1.0) / 2.0).transpose(0, 3, 1, 2)
     rec_loss = jnp.mean(jnp.abs(x_rec - target))
-    lpips_val = lpips_model(x_rec, target)
+    lpips_val = lpips_model(target, x_rec)
     return rec_loss, lpips_val, x_rec, target
 
 
